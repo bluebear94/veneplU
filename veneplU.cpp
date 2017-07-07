@@ -9,6 +9,7 @@
 #include <wchar.h>
 
 #include <algorithm>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -272,11 +273,19 @@ class Buffer {
 public:
   Buffer() {
     getTerminalDimensions(width, height);
-    addLineAtBack("I will shank your fucking mom");
-    addLineAtBack("E-I-E-I-O");
-    addLineAtBack("\tこんにちは");
-    addLineAtBack("This line has invalid UTF-8 bytes like \x89");
-    addLineAtBack("This one has control characters like \3");
+  }
+  void read(const char* fname) {
+    filename = fname;
+    std::ifstream fh(fname, std::ios::binary);
+    std::string curLine;
+    while (!fh.eof()) {
+      char c = fh.get();
+      if (c == '\n') {
+        addLineAtBack(curLine);
+        curLine = "";
+      }
+      else curLine += c;
+    }
   }
   std::vector<std::string> lines;
   std::vector<size_t> vlengths;
@@ -286,6 +295,7 @@ public:
   size_t cursorVCol = 0;
   size_t scrollRow = 0;
   size_t width, height;
+  std::string filename;
   void draw() {
     // Clear entire screen and the scrollback buffer,
     // and move the cursor to the top-left corner.
@@ -413,13 +423,15 @@ private:
   }
 };
 
-int main() {
+int main(int argc, char** argv) {
   setlocale(LC_ALL, "");
   saveCanonicalMode();
   setRawMode();
   atexit(restoreCanonicalMode);
   Buffer buffer;
+  if (argc > 1) buffer.read(argv[1]);
   int keycode = 0;
+  buffer.draw();
   while (keycode != SpecialKeys::QUIT) {
     keycode = getKey();
     //std::cout << keycode << "\r\n";
