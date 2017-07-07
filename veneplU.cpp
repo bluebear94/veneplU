@@ -208,6 +208,7 @@ enum SpecialKeys {
   ENTER,
   SAVE,
   COPY,
+  SAVE_AS,
 };
 
 int getKey() {
@@ -263,6 +264,15 @@ int getKey() {
   if (c1 == 17) return SpecialKeys::QUIT;
   if (c1 == 19) return SpecialKeys::SAVE;
   if (c1 == 3) return SpecialKeys::COPY;
+  if (c1 == 28) {
+    int codepoint = getKey();
+    switch (codepoint) {
+    case SpecialKeys::SAVE:
+      return SpecialKeys::SAVE_AS;
+    default:
+      return codepoint;
+    }
+  }
   return SpecialKeys::UNKNOWN;
 }
 
@@ -443,6 +453,7 @@ public:
       case SpecialKeys::DELETE: del(); break;
       case SpecialKeys::ENTER: insertNewLine(); break;
       case SpecialKeys::SAVE: saveIntractive(); break;
+      case SpecialKeys::SAVE_AS: saveIntractive(true); break;
       case SpecialKeys::UNKNOWN: break;
       default: insert(keycode);
     }
@@ -661,9 +672,9 @@ private:
     output += "m";
     output += message;
   }
-  void saveIntractive() {
+  void saveIntractive(bool forcePrompt = false) {
     std::string fname;
-    if (filename == "") {
+    if (filename == "" || forcePrompt) {
       message = "Sydál kentos mej kemeṫa?";
       messageColour = 14;
       bool stat1 = prompt();
