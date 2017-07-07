@@ -1,4 +1,5 @@
 #define _X_OPEN_SOURCE
+#include <locale.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -13,6 +14,8 @@
 #include <vector>
 
 const char* CLEAR_EVERYTHING = "\x1b[2J\x1b[3J\x1b[H\x1b[0m";
+const char* HEX_DIGITS = "0123456789ABCDEF";
+const char* DOZ_DIGITS = "0123456789XE";
 
 struct termios oldSettings;
 
@@ -138,11 +141,15 @@ private:
       --j;
     } while (j > 0 && (isContinuation(s[j]) || ((unsigned char) s[j] >= 248)));
     // Now verify that this is a valid UTF-8 sequence
+    // and spans all the way to the old position
     i = j;
-    int codepoint = get2();
-    // Not a valid UTF-8 sequence. Recede only one byte.
-    if (codepoint < 0) {
+    int codepoint = get2<true>();
+    // Not a valid UTF-8 sequence or it doesn't span all the way
+    // Recede only one byte.
+    if (codepoint < 0 || position() != oldI) {
       i = oldI - 1;
+    } else {
+      i = j;
     }
   }
   static bool isASCII(unsigned char c) {
@@ -211,7 +218,7 @@ template<typename N> std::string&& toString(N n) {
   }
   while (n != 0) {
     int d = n % 12;
-    s += "0123456789XE"[d];
+    s += DOZ_DIGITS[d];
     n /= 12;
   }
   if (negative) s += '-';
@@ -223,11 +230,11 @@ template<typename N> std::string&& toString(N n) {
 constexpr size_t TAB_WIDTH = 2;
 
 size_t wcwidthp(int codepoint) {
-  // Byte characters are drawn as their hex in reverse video
-  // Control characters are drawn as ^ plus another character
-  if (codepoint < 32) return 2;
   // Tab width is configurable
   if (codepoint == '\t') return TAB_WIDTH;
+  // Invalid byte characters are drawn as their hex in reverse video
+  // Control characters are drawn as ^ plus another character
+  if (codepoint < 32) return 2;
   return wcwidth(codepoint);
 }
 
@@ -241,12 +248,35 @@ size_t wcswidthp(const std::string& s) {
   return sum;
 }
 
+size_t wcswidthp(const std::string& s, size_t len) {
+  size_t sum = 0;
+  UTF8Iterator<const std::string> begin(s), end(s, len);
+  while (begin != end) {
+    int codepoint = begin.getAndAdvance();
+    sum += wcwidthp(codepoint);
+  }
+  return sum;
+}
+
+size_t unwcswidthp(const std::string& s, size_t vlen) {
+  size_t sum = 0;
+  UTF8Iterator<const std::string> begin(s), end(s, true);
+  while (sum < vlen && begin != end) {
+    int codepoint = begin.getAndAdvance();
+    sum += wcwidthp(codepoint);
+  }
+  return begin.position();
+}
+
 class Buffer {
 public:
   Buffer() {
     getTerminalDimensions(width, height);
     addLineAtBack("I will shank your fucking mom");
     addLineAtBack("E-I-E-I-O");
+    addLineAtBack("\tこんにちは");
+    addLineAtBack("This line has invalid UTF-8 bytes like \x89");
+    addLineAtBack("This one has control characters like \3");
   }
   std::vector<std::string> lines;
   std::vector<size_t> vlengths;
@@ -266,7 +296,7 @@ public:
       if (lineno >= lines.size()) {
         output += "\x1b[34m~\x1b[0m\r\n";
       } else {
-        output += lines[lineno];
+        drawLine(lines[lineno], output);
         output += "\r\n";
       }
     }
@@ -288,7 +318,7 @@ public:
     output += "\x1b[";
     output += std::to_string(cursorRow - scrollRow + 1); // row
     output += ";";
-    output += std::to_string(std::min(cursorVCol, lines[cursorRow].length()) + 1); // column
+    output += std::to_string(std::min(cursorVCol, vlengths[cursorRow]) + 1); // column
     output += "H";
 
     // Finally, actually render the damn thing.
@@ -305,7 +335,7 @@ public:
 private:
   void left() {
     cursorCol = std::min(cursorCol, lines[cursorRow].length());
-    cursorVCol = std::min(cursorVCol, lines[cursorRow].length());
+    cursorVCol = std::min(cursorVCol, vlengths[cursorRow]);
     if (cursorCol > 0) {
       UTF8Iterator it(lines[cursorRow], cursorCol);
       --it;
@@ -317,7 +347,7 @@ private:
   }
   void right() {
     cursorCol = std::min(cursorCol, lines[cursorRow].length());
-    cursorVCol = std::min(cursorVCol, lines[cursorRow].length());
+    cursorVCol = std::min(cursorVCol, vlengths[cursorRow]);
     if (cursorCol < lines[cursorRow].length()) {
       UTF8Iterator it(lines[cursorRow], cursorCol);
       int codepoint = it.getAndAdvance();
@@ -329,20 +359,62 @@ private:
   void up() {
     if (cursorRow > 0) {
       --cursorRow;
+      cursorCol = unwcswidthp(lines[cursorRow], cursorVCol);
+      cursorVCol = wcswidthp(lines[cursorRow], cursorCol);
     }
   }
   void down() {
     if (cursorRow < lines.size()) {
       ++cursorRow;
+      cursorCol = unwcswidthp(lines[cursorRow], cursorVCol);
+      cursorVCol = wcswidthp(lines[cursorRow], cursorCol);
     }
   }
   void addLineAtBack(const std::string& s) {
     lines.push_back(s);
     vlengths.push_back(wcswidthp(s));
   }
+  void drawLine(const std::string& s, std::string& output) {
+    // Draws the current line
+    size_t taken = 0;
+    UTF8Iterator<const std::string> it(s), end(s, true);
+    // - 1 to leave room for a $ in case we need more lines
+    while (taken < width - 1 && it != end) {
+      size_t oldPosition = it.position();
+      int codepoint = it.getAndAdvance();
+      size_t len = it.position() - oldPosition;
+      // Append as-is
+      if (codepoint >= ' ')
+        output += s.substr(oldPosition, len);
+      // Is it an invalid byte?
+      else if (codepoint < 0) {
+        int byte = -codepoint;
+        int high = (byte >> 4) & 15; // cut to 0 - 15 range for good measure
+        int low = byte & 15;
+        output += "\x1b[7m"; // reverse video
+        output += HEX_DIGITS[high];
+        output += HEX_DIGITS[low];
+        output += "\x1b[0m"; // reset
+      }
+      // Is it tab?
+      else if (codepoint == '\t') {
+        for (size_t i = 0; i < TAB_WIDTH; ++i)
+          output += " ";
+      }
+      // Is it a control character?
+      else if (codepoint < ' ') {
+        output += "\x1b[7m"; // reverse video
+        output += '^';
+        output += ('@' + codepoint);
+        output += "\x1b[0m"; // reset
+      }
+      taken += len;
+    }
+  }
 };
 
 int main() {
+  setlocale(LC_ALL, "");
   saveCanonicalMode();
   setRawMode();
   atexit(restoreCanonicalMode);
@@ -354,4 +426,14 @@ int main() {
     buffer.react(keycode);
     buffer.draw();
   }
+  /*
+  std::string s = "こんにちは";
+  UTF8Iterator<const std::string> begin(s), end(s, true);
+  while (begin != end) {
+    int codepoint = begin.getAndAdvance();
+    std::cout << codepoint << " [" << wcwidth(codepoint) << "] ";
+  }
+  std::cout << '\n';
+  std::cin.get();
+  */
 }
