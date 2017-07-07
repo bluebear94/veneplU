@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
@@ -45,6 +46,18 @@ void getTerminalDimensions(size_t& width, size_t& height) {
   ioctl(0, TIOCGWINSZ, &w);
   width = w.ws_col;
   height = w.ws_row;
+}
+
+int mkdirRecursive(std::string dir) {
+  size_t lastSlash = dir.rfind('/');
+  if (lastSlash != std::string::npos) {
+    int stat = mkdirRecursive(dir.substr(0, lastSlash));
+    if (stat != 0) return stat;
+  }
+  int stat = mkdir(dir.c_str(),
+      S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+  if (stat != 0) return errno;
+  return 0;
 }
 
 bool isASCII(unsigned char c) {
@@ -193,6 +206,8 @@ enum SpecialKeys {
   BACKSPACE,
   DELETE,
   ENTER,
+  SAVE,
+  COPY,
 };
 
 int getKey() {
@@ -246,6 +261,8 @@ int getKey() {
     return SpecialKeys::UNKNOWN;
   }
   if (c1 == 17) return SpecialKeys::QUIT;
+  if (c1 == 19) return SpecialKeys::SAVE;
+  if (c1 == 3) return SpecialKeys::COPY;
   return SpecialKeys::UNKNOWN;
 }
 
@@ -333,8 +350,11 @@ class Buffer {
 public:
   Buffer() {
     getTerminalDimensions(width, height);
+    addLineAtBack("");
   }
   void read(const char* fname) {
+    lines.clear();
+    vlengths.clear();
     filename = fname;
     std::ifstream fh(fname, std::ios::binary);
     std::string curLine;
@@ -355,6 +375,12 @@ public:
   size_t cursorVCol = 0;
   size_t scrollRow = 0;
   size_t width, height;
+  bool dirty = false;
+  bool prompting = false;
+  std::string message;
+  std::string promptInput;
+  size_t promptVLength;
+  int messageColour;
   std::string filename;
   void draw() {
     // Clear entire screen and the scrollback buffer,
@@ -367,39 +393,47 @@ public:
         output += "\x1b[34m~\x1b[0m\r\n";
       } else {
         drawLine(lines[lineno], output);
-        output += "\r\n";
       }
     }
-    // Info about the buffer.
-    output += "\x1b[32;1mveneplū\x1b[0m -";
-    if (filename != "") {
-      output += " \x1b[35;1m";
-      output += filename;
+    if (message.empty()) {
+      // Info about the buffer.
+      output += "\x1b[32;1mveneplū\x1b[0m -";
+      if (filename != "") {
+        output += " \x1b[35;1m";
+        output += filename;
+        if (dirty)
+          output += "\x1b[31;1m*";
+      } else {
+        output += " \x1b[31;1m*";
+      }
+      output += " \x1b[36;1m";
+      output += toString(lines.size()) + " v";
+      output +=
+        (lines.size() == 1) ? 'a' : 'e';
+      output += "tál ";
+      output += toString(cursorRow + 1);
+      output +=
+        (cursorRow == 0) ? "ma" :
+        (cursorRow == 1) ? "mu" : "ru";
+      output += " ";
+      output += toString(cursorCol);
+      output += " ";
+      output += toString(cursorVCol);
+      // Move cursor to correct position.
+      output += "\x1b[";
+      output += std::to_string(cursorRow - scrollRow + 1); // row
+      output += ";";
+      output += std::to_string(std::min(cursorVCol, vlengths[cursorRow]) + 1); // column
+      output += "H";
+    } else {
+      drawMessage(output);
     }
-    output += " \x1b[36;1m";
-    output += toString(lines.size()) + " v";
-    output +=
-      (lines.size() == 1) ? 'a' : 'e';
-    output += "tál ";
-    output += toString(cursorRow + 1);
-    output +=
-      (cursorRow == 0) ? "ma" :
-      (cursorRow == 1) ? "mu" : "ru";
-    output += " ";
-    output += toString(cursorCol);
-    output += " ";
-    output += toString(cursorVCol);
-    // Move cursor to correct position.
-    output += "\x1b[";
-    output += std::to_string(cursorRow - scrollRow + 1); // row
-    output += ";";
-    output += std::to_string(std::min(cursorVCol, vlengths[cursorRow]) + 1); // column
-    output += "H";
 
     // Finally, actually render the damn thing.
     std::cout << output;
   }
   void react(int keycode) {
+    message = "";
     switch (keycode) {
       case SpecialKeys::LEFT: left(); break;
       case SpecialKeys::RIGHT: right(); break;
@@ -408,41 +442,47 @@ public:
       case SpecialKeys::BACKSPACE: backspace(); break;
       case SpecialKeys::DELETE: del(); break;
       case SpecialKeys::ENTER: insertNewLine(); break;
+      case SpecialKeys::SAVE: saveIntractive(); break;
       case SpecialKeys::UNKNOWN: break;
       default: insert(keycode);
     }
   }
 private:
   void left() {
-    cursorCol = std::min(cursorCol, lines[cursorRow].length());
-    cursorVCol = std::min(cursorVCol, vlengths[cursorRow]);
+    auto& line = prompting ? promptInput : lines[cursorRow];
+    auto& vlength = prompting ? promptVLength : vlengths[cursorRow];
+    cursorCol = std::min(cursorCol, line.length());
+    cursorVCol = std::min(cursorVCol, vlength);
     if (cursorCol > 0) {
-      UTF8Iterator it(lines[cursorRow], cursorCol);
+      UTF8Iterator it(line, cursorCol);
       --it;
       int codepoint = it.get();
       cursorCol = it.position();
       cursorVCol -= wcwidthp(codepoint);
-    } else if (cursorRow > 0) {
+    } else if (cursorRow > 0 && !prompting) {
       --cursorRow;
       cursorCol = lines[cursorRow].length();
       cursorVCol = vlengths[cursorRow];
     }
   }
   void right() {
-    cursorCol = std::min(cursorCol, lines[cursorRow].length());
-    cursorVCol = std::min(cursorVCol, vlengths[cursorRow]);
-    if (cursorCol < lines[cursorRow].length()) {
-      UTF8Iterator it(lines[cursorRow], cursorCol);
+    auto& line = prompting ? promptInput : lines[cursorRow];
+    auto& vlength = prompting ? promptVLength : vlengths[cursorRow];
+    cursorCol = std::min(cursorCol, line.length());
+    cursorVCol = std::min(cursorVCol, vlength);
+    if (cursorCol < line.length()) {
+      UTF8Iterator it(line, cursorCol);
       int codepoint = it.getAndAdvance();
       cursorCol = it.position();
       cursorVCol += wcwidthp(codepoint);
-    } else if (cursorRow < lines.size()) {
+    } else if (cursorRow < lines.size() && !prompting) {
       ++cursorRow;
       cursorCol = 0;
       cursorVCol = 0;
     }
     // TODO advance one line if already at very right
   }
+  // The following two methods are not used in prompts.
   void up() {
     if (cursorRow > 0) {
       --cursorRow;
@@ -471,16 +511,21 @@ private:
     }
   }
   void del() {
-    if (cursorCol < lines[cursorRow].length()) {
-      UTF8Iterator it(lines[cursorRow], cursorCol);
+    auto& line = prompting ? promptInput : lines[cursorRow];
+    auto& vlength = prompting ? promptVLength : vlengths[cursorRow];
+    cursorCol = std::min(cursorCol, line.length());
+    cursorVCol = std::min(cursorVCol, vlength);
+    if (cursorCol < line.length()) {
+      UTF8Iterator it(line, cursorCol);
       int codepoint = it.getAndAdvance();
       int length = it.position() - cursorCol;
-      lines[cursorRow].erase(cursorCol, length);
-      vlengths[cursorRow] -= wcwidthp(codepoint);
+      line.erase(cursorCol, length);
+      vlength -= wcwidthp(codepoint);
       // Possibility of non-UTF-8 bytes merging into UTF-8 codepoints
       if (codepoint < 0)
-        cursorVCol = wcswidthp(lines[cursorRow], cursorCol);
-    } else if (cursorRow < lines.size() - 1) {
+        cursorVCol = wcswidthp(line, cursorCol);
+      if (!prompting) dirty = true;
+    } else if (cursorRow < lines.size() - 1 && !prompting) {
       // Merge the two lines
       lines[cursorRow] += lines[cursorRow + 1];
       vlengths[cursorRow] += vlengths[cursorRow + 1];
@@ -488,19 +533,24 @@ private:
     }
   }
   void backspace() {
+    auto& line = prompting ? promptInput : lines[cursorRow];
+    auto& vlength = prompting ? promptVLength : vlengths[cursorRow];
+    cursorCol = std::min(cursorCol, line.length());
+    cursorVCol = std::min(cursorVCol, vlength);
     if (cursorCol > 0) {
-      UTF8Iterator it(lines[cursorRow], cursorCol);
+      UTF8Iterator it(line, cursorCol);
       --it;
       cursorCol = it.position();
       int codepoint = it.getAndAdvance();
       int length = it.position() - cursorCol;
       cursorVCol -= wcwidthp(codepoint);
-      lines[cursorRow].erase(cursorCol, length);
-      vlengths[cursorRow] -= wcwidthp(codepoint);
+      line.erase(cursorCol, length);
+      vlength -= wcwidthp(codepoint);
       // Possibility of non-UTF-8 bytes merging into UTF-8 codepoints
       if (codepoint < 0)
-        cursorVCol = wcswidthp(lines[cursorRow], cursorCol);
-    } else if (cursorRow > 0) {
+        cursorVCol = wcswidthp(line, cursorCol);
+      if (!prompting) dirty = true;
+    } else if (cursorRow > 0 && !prompting) {
       // Merge the two lines
       --cursorRow;
       cursorCol = lines[cursorRow].length();
@@ -508,22 +558,29 @@ private:
       lines[cursorRow] += lines[cursorRow + 1];
       vlengths[cursorRow] += vlengths[cursorRow + 1];
       lines.erase(lines.begin() + cursorRow + 1);
+      dirty = true;
     }
   }
   void insert(int codepoint) {
+    auto& line = prompting ? promptInput : lines[cursorRow];
+    auto& vlength = prompting ? promptVLength : vlengths[cursorRow];
+    cursorCol = std::min(cursorCol, line.length());
+    cursorVCol = std::min(cursorVCol, vlength);
     // non-newline case
-    if (cursorRow == lines.size()) {
+    if (!prompting && cursorRow == lines.size()) {
       addLineAtBack("");
     }
     std::string insertion = utf8CodepointToChar(codepoint);
-    lines[cursorRow].insert(cursorCol, insertion);
+    line.insert(cursorCol, insertion);
     cursorCol += insertion.length();
     cursorVCol += wcwidthp(codepoint);
-    vlengths[cursorRow] += wcwidthp(codepoint);
+    vlength += wcwidthp(codepoint);
     // Possibility of non-UTF-8 bytes merging into UTF-8 codepoints
     if (codepoint < 0)
-      cursorVCol = wcswidthp(lines[cursorRow], cursorCol);
+      cursorVCol = wcswidthp(line, cursorCol);
+    if (!prompting) dirty = true;
   }
+  // Not used in prompts.
   void insertNewLine() {
     // Split the line in two. Anything after the cursor gets moved
     // to another line.
@@ -533,6 +590,7 @@ private:
     ++cursorRow;
     cursorCol = 0;
     cursorVCol = 0;
+    dirty = true;
   }
   void addLineAtBack(const std::string& s) {
     lines.push_back(s);
@@ -542,15 +600,22 @@ private:
     lines.insert(lines.begin() + i, s);
     vlengths.insert(vlengths.begin() + i, wcswidthp(s));
   }
-  void drawLine(const std::string& s, std::string& output) {
+  void drawLine(const std::string& s, std::string& output,
+      size_t start = 0, bool newline = true) {
     // Draws the current line
     size_t taken = 0;
     UTF8Iterator<const std::string> it(s), end(s, true);
+    bool broken = false;
     // - 1 to leave room for a $ in case we need more lines
-    while (taken < width - 1 && it != end) {
+    while (it != end) {
       size_t oldPosition = it.position();
       int codepoint = it.getAndAdvance();
       size_t len = it.position() - oldPosition;
+      size_t w = wcwidthp(codepoint);
+      if (taken + w >= width + 1 - start) {
+        broken = true;
+        break;
+      }
       // Append as-is
       if (codepoint >= ' ')
         output += s.substr(oldPosition, len);
@@ -582,6 +647,121 @@ private:
       }
       taken += len;
     }
+    if (broken) {
+      output += "\x1b[9999C\x1b[34;1m$\x1b[0m";
+      if (newline) output += "\x1b[E";
+    }
+    else if (newline) output += "\r\n";
+  }
+  void drawMessage(std::string& output) {
+    output += "\x1b[3";
+    output += (char) ('0' + (messageColour & 7));
+    if ((messageColour & 8) != 0)
+      output += ";1";
+    output += "m";
+    output += message;
+  }
+  void saveIntractive() {
+    std::string fname;
+    if (filename == "") {
+      message = "Sydál kentos mej kemeṫa?";
+      messageColour = 14;
+      bool stat1 = prompt();
+      if (!stat1 || promptInput.empty()) {
+        message = "Syda kêl neltera.";
+        messageColour = 1;
+        return;
+      }
+      fname = promptInput;
+    } else fname = filename;
+    std::error_code stat = save(fname);
+    if (stat) {
+      message = "Syda kêl nelteġera: ";
+      message += stat.message();
+      messageColour = 9;
+    } else {
+      message = "Syda neltera.";
+      messageColour = 10;
+    }
+  }
+  std::error_code save(const std::string& fname) {
+    // Create the parent directory (if needed)
+    size_t lastSlash = fname.rfind('/');
+    if (lastSlash != std::string::npos) {
+      int stat = mkdirRecursive(fname.substr(0, lastSlash));
+      if (stat != 0) return std::error_code(stat, std::system_category());
+    }
+    // Create the actual file
+    std::ofstream out;
+    out.open(fname, std::ios::binary | std::ios::out);
+    // Output each line
+    for (const std::string& line : lines) {
+      out << line << '\n';
+    }
+    if (!out.good()) return std::error_code(errno, std::system_category());
+    dirty = false;
+    filename = fname;
+    return std::error_code();
+  }
+  bool prompt() {
+    // Save cursor position
+    size_t oldCol = cursorCol;
+    size_t oldVCol = cursorVCol;
+    prompting = true;
+    cursorCol = 0;
+    cursorVCol = 0;
+    promptInput = "";
+    std::string output;
+    output += "\x1b[";
+    output += std::to_string(height);
+    output += ";1H\x1b[0m";
+    for (size_t i = 0; i < width; ++i) output +=  ' ';
+    output += "\x1b[";
+    output += std::to_string(height);
+    output += ";1H";
+    drawMessage(output);
+    output += "  ";
+    std::cout << output;
+    size_t offset = wcswidthp(message);
+    int keycode = 0;
+    bool done = false;
+    while (true) {
+      keycode = getKey();
+      if (keycode == SpecialKeys::QUIT) break;
+      else if (keycode == SpecialKeys::ENTER) {
+        done = true;
+        break;
+      }
+      switch (keycode) {
+        case SpecialKeys::LEFT: left(); break;
+        case SpecialKeys::RIGHT: right(); break;
+        case SpecialKeys::BACKSPACE: backspace(); break;
+        case SpecialKeys::DELETE: del(); break;
+        case SpecialKeys::UNKNOWN: break;
+        default: insert(keycode);
+      }
+      std::string output;
+      // Move cursor 2 spaces after message
+      output += "\x1b[";
+      output += std::to_string(height);
+      output += ';';
+      output += std::to_string(offset + 3);
+      output += 'H';
+      for (size_t i = offset + 3; i < width; ++i) output += ' ';
+      output += "\x1b[";
+      output += std::to_string(height);
+      output += ';';
+      output += std::to_string(offset + 3);
+      output += 'H';
+      // Print message
+      drawLine(promptInput, output, offset + 2, false);
+      std::cout << output;
+    }
+    prompting = false;
+    // Restore cursor position
+    cursorCol = oldCol;
+    cursorVCol = oldVCol;
+    return done;
   }
 };
 
