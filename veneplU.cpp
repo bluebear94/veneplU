@@ -1,15 +1,18 @@
+#define _X_OPEN_SOURCE
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
+#include <wchar.h>
 
+#include <algorithm>
 #include <iostream>
 #include <string>
 #include <vector>
 
-const char* CLEAR_EVERYTHING = "\x1b[2J\x1b[3J\x1b[H";
+const char* CLEAR_EVERYTHING = "\x1b[2J\x1b[3J\x1b[H\x1b[0m";
 
 struct termios oldSettings;
 
@@ -43,12 +46,15 @@ void getTerminalDimensions(size_t& width, size_t& height) {
 // since returning a reference upon dereferencing
 // is not feasible. To emphasise this, we use different
 // names for the dereferencing methods.
+template<typename S = std::string>
 class UTF8Iterator {
 public:
   UTF8Iterator(const UTF8Iterator& other)
     : s(other.s), i(other.i) {}
-  UTF8Iterator(std::string& s, bool end = false)
+  UTF8Iterator(S& s, bool end = false)
     : s(s), i(end ? s.length() : 0) {}
+  UTF8Iterator(S& s, size_t i)
+    : s(s), i(i) {}
   int get() const {
     return const_cast<UTF8Iterator*>(this)->get2<false>();
   }
@@ -75,6 +81,15 @@ public:
     recede();
     return old;
   }
+  size_t position() const {
+    return i;
+  }
+  bool operator==(const UTF8Iterator& other) {
+    return &(s) == &(other.s) && i == other.i;
+  }
+  bool operator!=(const UTF8Iterator& other) {
+    return !(*this == other);
+  }
 private:
   template<bool advance = false, bool lmode = false>
   int get2() {
@@ -94,14 +109,16 @@ private:
       size_t expectedContinuations = expectedContinuationBytes(curr);
       codepoint = curr - starterOffsets[expectedContinuations - 1];
       bool ok = true;
-      for (size_t k = 1; k <= expectedContinuations; ++k) {
-        unsigned char cont = s[i + k];
-        if (!isContinuation(cont)) {
-          ok = false;
-          break;
+      if (j + expectedContinuations <= s.length()) {
+        for (size_t k = 1; k <= expectedContinuations; ++k) {
+          unsigned char cont = s[i + k];
+          if (!isContinuation(cont)) {
+            ok = false;
+            break;
+          }
+          codepoint = (codepoint << 6) | (cont & 0x7f);
         }
-        codepoint = (codepoint << 6) | (cont & 0x7f);
-      }
+      } else ok = false;
       if (ok)
         j += expectedContinuations;
       else
@@ -149,17 +166,90 @@ private:
       is3ByteStarter(c) ? 2 : 3;
   }
   static constexpr int starterOffsets[3] = {192, 224, 240};
-  std::string& s;
+  S& s;
   size_t i;
 };
+
+enum SpecialKeys {
+  UNKNOWN = 9001,
+  UP,
+  DOWN,
+  LEFT,
+  RIGHT,
+  QUIT,
+};
+
+int getKey() {
+  using std::cin;
+  char c1 = cin.get();
+  if (c1 >= 32) return c1;
+  if (c1 == 27) {
+    char c2 = cin.get();
+    if (c2 == 91) {
+      char c3 = cin.get();
+      switch (c3) {
+        case 65: return SpecialKeys::UP;
+        case 66: return SpecialKeys::DOWN;
+        case 68: return SpecialKeys::LEFT;
+        case 67: return SpecialKeys::RIGHT;
+        default: return SpecialKeys::UNKNOWN;
+      }
+    }
+    return SpecialKeys::UNKNOWN;
+  }
+  if (c1 == 17) return SpecialKeys::QUIT;
+  return SpecialKeys::UNKNOWN;
+}
+
+template<typename N> std::string&& toString(N n) {
+  if (n == 0) return std::move(std::string("0"));
+  std::string s;
+  bool negative = false;
+  if (n < 0) {
+    negative = true;
+    n = -n;
+  }
+  while (n != 0) {
+    int d = n % 12;
+    s += "0123456789XE"[d];
+    n /= 12;
+  }
+  if (negative) s += '-';
+  std::reverse(s.begin(), s.end());
+  return std::move(s);
+}
+
+// My personal favourite
+constexpr size_t TAB_WIDTH = 2;
+
+size_t wcwidthp(int codepoint) {
+  // Byte characters are drawn as their hex in reverse video
+  // Control characters are drawn as ^ plus another character
+  if (codepoint < 32) return 2;
+  // Tab width is configurable
+  if (codepoint == '\t') return TAB_WIDTH;
+  return wcwidth(codepoint);
+}
+
+size_t wcswidthp(const std::string& s) {
+  size_t sum = 0;
+  UTF8Iterator<const std::string> begin(s), end(s, true);
+  while (begin != end) {
+    int codepoint = begin.getAndAdvance();
+    sum += wcwidthp(codepoint);
+  }
+  return sum;
+}
 
 class Buffer {
 public:
   Buffer() {
     getTerminalDimensions(width, height);
-    lines.push_back("I will shank your fucking mom");
+    addLineAtBack("I will shank your fucking mom");
+    addLineAtBack("E-I-E-I-O");
   }
   std::vector<std::string> lines;
+  std::vector<size_t> vlengths;
   // cursorCol can extend beyond the line length, but that
   // is treated as the end of that line
   size_t cursorRow = 0, cursorCol = 0;
@@ -180,8 +270,75 @@ public:
         output += "\r\n";
       }
     }
+    // Info about the buffer.
+    output += "\x1b[32;1mveneplū\x1b[0m - \x1b[36;1m";
+    output += toString(lines.size()) + " v";
+    output +=
+      (lines.size() == 1) ? 'a' : 'e';
+    output += "tál ";
+    output += toString(cursorRow + 1);
+    output +=
+      (cursorRow == 0) ? "ma" :
+      (cursorRow == 1) ? "mu" : "ru";
+    output += " ";
+    output += toString(cursorCol);
+    output += " ";
+    output += toString(cursorVCol);
+    // Move cursor to correct position.
+    output += "\x1b[";
+    output += std::to_string(cursorRow - scrollRow + 1); // row
+    output += ";";
+    output += std::to_string(std::min(cursorVCol, lines[cursorRow].length()) + 1); // column
+    output += "H";
+
     // Finally, actually render the damn thing.
     std::cout << output;
+  }
+  void react(int keycode) {
+    switch (keycode) {
+      case SpecialKeys::LEFT: left(); break;
+      case SpecialKeys::RIGHT: right(); break;
+      case SpecialKeys::UP: up(); break;
+      case SpecialKeys::DOWN: down(); break;
+    }
+  }
+private:
+  void left() {
+    cursorCol = std::min(cursorCol, lines[cursorRow].length());
+    cursorVCol = std::min(cursorVCol, lines[cursorRow].length());
+    if (cursorCol > 0) {
+      UTF8Iterator it(lines[cursorRow], cursorCol);
+      --it;
+      int codepoint = it.get();
+      cursorCol = it.position();
+      cursorVCol -= wcwidthp(codepoint);
+    }
+    // TODO move back one line if already at very left
+  }
+  void right() {
+    cursorCol = std::min(cursorCol, lines[cursorRow].length());
+    cursorVCol = std::min(cursorVCol, lines[cursorRow].length());
+    if (cursorCol < lines[cursorRow].length()) {
+      UTF8Iterator it(lines[cursorRow], cursorCol);
+      int codepoint = it.getAndAdvance();
+      cursorCol = it.position();
+      cursorVCol += wcwidthp(codepoint);
+    }
+    // TODO advance one line if already at very right
+  }
+  void up() {
+    if (cursorRow > 0) {
+      --cursorRow;
+    }
+  }
+  void down() {
+    if (cursorRow < lines.size()) {
+      ++cursorRow;
+    }
+  }
+  void addLineAtBack(const std::string& s) {
+    lines.push_back(s);
+    vlengths.push_back(wcswidthp(s));
   }
 };
 
@@ -189,11 +346,12 @@ int main() {
   saveCanonicalMode();
   setRawMode();
   atexit(restoreCanonicalMode);
-  char c = 0;
   Buffer buffer;
-  while (c != '\3') {
-    read(0, &c, 1);
-    //std::cout << ((int) c) << "\r\n";
+  int keycode = 0;
+  while (keycode != SpecialKeys::QUIT) {
+    keycode = getKey();
+    //std::cout << keycode << "\r\n";
+    buffer.react(keycode);
     buffer.draw();
   }
 }
