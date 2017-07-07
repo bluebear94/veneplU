@@ -196,6 +196,26 @@ private:
   size_t i;
 };
 
+std::string&& utf8CodepointToChar(int code) {
+  if (code < 0) return std::move(std::string(1, (char) -code));
+  if (code < 128) return std::move(std::string(1, (char) code));
+  std::string s;
+  if (code < 0x800) { // 2 bytes
+    s += (char) (0xC0 | (code >> 6));
+    s += (char) (0x80 | (code & 63));
+  } else if (code < 0x10000) { // 3 bytes
+    s += (char) (0xE0 | (code >> 12));
+    s += (char) (0x80 | ((code >> 6) & 63));
+    s += (char) (0x80 | (code & 63));
+  } else if (code < 0x101000) { // 4 bytes
+    s += (char) (0xF0 | (code >> 18));
+    s += (char) (0x80 | ((code >> 12) & 63));
+    s += (char) (0x80 | ((code >> 6) & 63));
+    s += (char) (0x80 | (code & 63));
+  }
+  return std::move(s);
+}
+
 enum SpecialKeys {
   UNKNOWN = -9001,
   UP,
@@ -209,6 +229,7 @@ enum SpecialKeys {
   SAVE,
   COPY,
   SAVE_AS,
+  DHR_MODE,
 };
 
 int getKey() {
@@ -273,27 +294,8 @@ int getKey() {
       return codepoint;
     }
   }
+  if (c1 == 4) return SpecialKeys::DHR_MODE;
   return SpecialKeys::UNKNOWN;
-}
-
-std::string&& utf8CodepointToChar(int code) {
-  if (code < 0) return std::move(std::string(1, (char) -code));
-  if (code < 128) return std::move(std::string(1, (char) code));
-  std::string s;
-  if (code < 0x800) { // 2 bytes
-    s += (char) (0xC0 | (code >> 6));
-    s += (char) (0x80 | (code & 63));
-  } else if (code < 0x10000) { // 3 bytes
-    s += (char) (0xE0 | (code >> 12));
-    s += (char) (0x80 | ((code >> 6) & 63));
-    s += (char) (0x80 | (code & 63));
-  } else if (code < 0x101000) { // 4 bytes
-    s += (char) (0xF0 | (code >> 18));
-    s += (char) (0x80 | ((code >> 12) & 63));
-    s += (char) (0x80 | ((code >> 6) & 63));
-    s += (char) (0x80 | (code & 63));
-  }
-  return std::move(s);
 }
 
 template<typename N> std::string&& toString(N n) {
@@ -313,6 +315,68 @@ template<typename N> std::string&& toString(N n) {
   std::reverse(s.begin(), s.end());
   return std::move(s);
 }
+
+const char* VOWELS = "aeiouy";
+class DHRBox {
+public:
+  int feed(int key) {
+    int res = feed2(key);
+    if (res >= 0) reset();
+    return res;
+  }
+  bool upper = false;
+  bool forceStress = false;
+  bool forceUnstress = false;
+  void reset() {
+    upper = false;
+    forceStress = false;
+    forceUnstress = false;
+  }
+private:
+  int feed2(int key) {
+    if (key == 'q') upper = !upper;
+    else if (key == '\'') {
+      forceStress = !forceStress;
+      if (forceStress) forceUnstress = false;
+    } else if (key == '`') {
+      forceUnstress = !forceUnstress;
+      if (forceUnstress) forceStress = false;
+    } else if (key == 'x') {
+      return upper ? L'Ḣ' : L'ḣ';
+    } else if (islower(key)) {
+      if (forceStress) {
+        const char* where = strchr(VOWELS, key);
+        if (where != nullptr)
+          return (upper ? L"ÁÉÍÓÚÝ" : L"áéíóúý")[where - VOWELS];
+      }
+      return upper ? toupper(key) : key;
+    } else if (isupper(key)) {
+      if (forceUnstress) {
+        const char* where = strchr(VOWELS, tolower(key));
+        if (where != nullptr)
+          return (upper ? L"ĀĒĪŌŪȲ" : L"āēīōūȳ")[where - VOWELS];
+      }
+      return (upper ? uumap : ulmap)[key - 'A'];
+    } else return key;
+    return -1;
+  }
+  static constexpr wchar_t ulmap[26] = {
+    L'â', 0, 0, L'ḋ', L'ê',
+    0, L'ġ', L'ħ', L'î', 0,
+    0, 0, 0, L'ṅ', L'ô',
+    0, 0, 0, L'ṡ', L'ṫ',
+    L'û', 0, L'ẏ', 0, L'ŷ',
+    L'ż'
+  };
+  static constexpr wchar_t uumap[26] = {
+    L'Â', 0, 0, L'Ḋ', L'Ê',
+    0, L'Ġ', L'Ħ', L'Î', 0,
+    0, 0, 0, L'Ṅ', L'Ô',
+    0, 0, 0, L'Ṡ', L'Ṫ',
+    L'Û', 0, L'Ẏ', 0, L'Ŷ',
+    L'Ż'
+  };
+}; // 'twas done
 
 // My personal favourite
 constexpr size_t TAB_WIDTH = 2;
@@ -392,6 +456,8 @@ public:
   size_t promptVLength;
   int messageColour;
   std::string filename;
+  DHRBox box;
+  bool isDHR;
   void draw() {
     // Clear entire screen and the scrollback buffer,
     // and move the cursor to the top-left corner.
@@ -425,10 +491,20 @@ public:
       output +=
         (cursorRow == 0) ? "ma" :
         (cursorRow == 1) ? "mu" : "ru";
-      output += " ";
-      output += toString(cursorCol);
-      output += " ";
-      output += toString(cursorVCol);
+      output += " | ";
+      output += toString(cursorVCol + 1);
+      output +=
+        (cursorVCol == 0) ? "ma" :
+        (cursorVCol == 1) ? "mu" : "ru";
+      output += " vżama";
+      if (isDHR) {
+        output += " \x1b[33;1mḊ[";
+        output += box.upper ? 'K' : 'k';
+        output +=
+          box.forceStress ? "ûú" :
+          box.forceUnstress ? "ūu" : "ûu";
+        output += "]";
+      }
       // Move cursor to correct position.
       output += "\x1b[";
       output += std::to_string(cursorRow - scrollRow + 1); // row
@@ -444,6 +520,13 @@ public:
   }
   void react(int keycode) {
     message = "";
+    if (isDHR && keycode >= 0) {
+      keycode = box.feed(keycode);
+      if (keycode <= 0) {
+        if (keycode == 0) std::cout << '\a';
+        keycode = SpecialKeys::UNKNOWN;
+      }
+    }
     switch (keycode) {
       case SpecialKeys::LEFT: left(); break;
       case SpecialKeys::RIGHT: right(); break;
@@ -454,6 +537,7 @@ public:
       case SpecialKeys::ENTER: insertNewLine(); break;
       case SpecialKeys::SAVE: saveIntractive(); break;
       case SpecialKeys::SAVE_AS: saveIntractive(true); break;
+      case SpecialKeys::DHR_MODE: isDHR = !isDHR; box.reset(); break;
       case SpecialKeys::UNKNOWN: break;
       default: insert(keycode);
     }
@@ -573,14 +657,14 @@ private:
     }
   }
   void insert(int codepoint) {
-    auto& line = prompting ? promptInput : lines[cursorRow];
-    auto& vlength = prompting ? promptVLength : vlengths[cursorRow];
-    cursorCol = std::min(cursorCol, line.length());
-    cursorVCol = std::min(cursorVCol, vlength);
     // non-newline case
     if (!prompting && cursorRow == lines.size()) {
       addLineAtBack("");
     }
+    auto& line = prompting ? promptInput : lines[cursorRow];
+    auto& vlength = prompting ? promptVLength : vlengths[cursorRow];
+    cursorCol = std::min(cursorCol, line.length());
+    cursorVCol = std::min(cursorVCol, vlength);
     std::string insertion = utf8CodepointToChar(codepoint);
     line.insert(cursorCol, insertion);
     cursorCol += insertion.length();
@@ -593,14 +677,18 @@ private:
   }
   // Not used in prompts.
   void insertNewLine() {
-    // Split the line in two. Anything after the cursor gets moved
-    // to another line.
-    addLineAt(lines[cursorRow].substr(cursorCol), cursorRow + 1);
-    lines[cursorRow].erase(cursorCol);
-    vlengths[cursorRow] = cursorVCol;
-    ++cursorRow;
-    cursorCol = 0;
-    cursorVCol = 0;
+    if (cursorRow == lines.size()) {
+      addLineAtBack("");
+    } else {
+      // Split the line in two. Anything after the cursor gets moved
+      // to another line.
+      addLineAt(lines[cursorRow].substr(cursorCol), cursorRow + 1);
+      lines[cursorRow].erase(cursorCol);
+      vlengths[cursorRow] = cursorVCol;
+      ++cursorRow;
+      cursorCol = 0;
+      cursorVCol = 0;
+    }
     dirty = true;
   }
   void addLineAtBack(const std::string& s) {
