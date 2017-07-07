@@ -65,6 +65,16 @@ public:
     (void) get2<true>();
     return old;
   }
+  UTF8Iterator& operator--() {
+    recede();
+    return *this;
+  }
+  UTF8Iterator operator--(int dummy) {
+    (void) dummy;
+    UTF8Iterator old(*this);
+    recede();
+    return old;
+  }
 private:
   template<bool advance = false, bool lmode = false>
   int get2() {
@@ -97,12 +107,26 @@ private:
       else
         codepoint = -curr;
     }
-    if constexpr (advance)
-      i = j;
+    if constexpr (advance) i = j;
     if constexpr (lmode)
       return j - oldI;
     else
       return codepoint;
+  }
+  void recede() {
+    // Go back a byte until we encounter an ASCII character or a starter
+    size_t oldI = i;
+    size_t j = i;
+    do {
+      --j;
+    } while (j > 0 && (isContinuation(s[j]) || ((unsigned char) s[j] >= 248)));
+    // Now verify that this is a valid UTF-8 sequence
+    i = j;
+    int codepoint = get2();
+    // Not a valid UTF-8 sequence. Recede only one byte.
+    if (codepoint < 0) {
+      i = oldI - 1;
+    }
   }
   static bool isASCII(unsigned char c) {
     return c < 128;
