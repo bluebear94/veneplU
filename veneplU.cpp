@@ -498,7 +498,7 @@ public:
   int messageColour;
   std::string filename;
   DHRBox box;
-  bool isDHR;
+  bool isDHR = false;
   class Options {
   public:
     Options() :
@@ -719,7 +719,7 @@ private:
       }
     }
     // Out of bounds?
-    if (cursorRow >= scrollRow + height) {
+    if (cursorRow >= scrollRow + height - 1) {
       ++scrollRow;
     }
   }
