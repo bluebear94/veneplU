@@ -1,9 +1,11 @@
 #define _X_OPEN_SOURCE
 #include <locale.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
@@ -232,8 +234,16 @@ enum SpecialKeys {
   DHR_MODE,
 };
 
+int get1c() {
+  unsigned char c;
+  read(0, &c, 1);
+  if (errno == EINTR) return -1;
+  return c;
+}
+
 int getKey() {
   using std::cin;
+  if (cin.eof()) return SpecialKeys::UNKNOWN;
   unsigned char c1 = cin.get();
   if (c1 == 127) return SpecialKeys::BACKSPACE;
   if (c1 >= 32) {
@@ -420,10 +430,15 @@ size_t unwcswidthp(const std::string& s, size_t vlen) {
   return begin.position();
 }
 
+// Define a global variable so the signal handler can use it
+class Buffer;
+Buffer* globalBuffer = nullptr;
+
 class Buffer {
 public:
   Buffer() {
     getTerminalDimensions(width, height);
+    registerHandler();
     addLineAtBack("");
   }
   void read(const char* fname) {
@@ -449,6 +464,7 @@ public:
   size_t cursorVCol = 0;
   size_t scrollRow = 0;
   size_t width, height;
+  bool shouldResize = false;
   bool dirty = false;
   bool prompting = false;
   std::string message;
@@ -459,6 +475,7 @@ public:
   DHRBox box;
   bool isDHR;
   void draw() {
+    resizeIfNecessary();
     // Clear entire screen and the scrollback buffer,
     // and move the cursor to the top-left corner.
     std::string output = CLEAR_EVERYTHING;
@@ -802,14 +819,7 @@ private:
     filename = fname;
     return std::error_code();
   }
-  bool prompt() {
-    // Save cursor position
-    size_t oldCol = cursorCol;
-    size_t oldVCol = cursorVCol;
-    prompting = true;
-    cursorCol = 0;
-    cursorVCol = 0;
-    promptInput = "";
+  void promptMessage() {
     std::string output;
     output += "\x1b[";
     output += std::to_string(height);
@@ -821,23 +831,37 @@ private:
     drawMessage(output);
     output += "  ";
     std::cout << output;
+  }
+  bool prompt() {
+    // Save cursor position
+    size_t oldCol = cursorCol;
+    size_t oldVCol = cursorVCol;
+    prompting = true;
+    cursorCol = 0;
+    cursorVCol = 0;
+    promptInput = "";
+    promptMessage();
     size_t offset = wcswidthp(message);
     int keycode = 0;
     bool done = false;
     while (true) {
-      keycode = getKey();
-      if (keycode == SpecialKeys::QUIT) break;
-      else if (keycode == SpecialKeys::ENTER) {
-        done = true;
-        break;
-      }
-      switch (keycode) {
-        case SpecialKeys::LEFT: left(); break;
-        case SpecialKeys::RIGHT: right(); break;
-        case SpecialKeys::BACKSPACE: backspace(); break;
-        case SpecialKeys::DELETE: del(); break;
-        case SpecialKeys::UNKNOWN: break;
-        default: insert(keycode);
+      if (resizeIfNecessary(true)) {
+        promptMessage();
+      } else {
+        keycode = getKey();
+        if (keycode == SpecialKeys::QUIT) break;
+        else if (keycode == SpecialKeys::ENTER) {
+          done = true;
+          break;
+        }
+        switch (keycode) {
+          case SpecialKeys::LEFT: left(); break;
+          case SpecialKeys::RIGHT: right(); break;
+          case SpecialKeys::BACKSPACE: backspace(); break;
+          case SpecialKeys::DELETE: del(); break;
+          case SpecialKeys::UNKNOWN: break;
+          default: insert(keycode);
+        }
       }
       std::string output;
       // Move cursor 2 spaces after message
@@ -862,6 +886,27 @@ private:
     cursorVCol = oldVCol;
     return done;
   }
+  static void handler(int sig, siginfo_t* si, void* mydata) {
+    globalBuffer->shouldResize = true;
+  }
+  void registerHandler() {
+    globalBuffer = this;
+    struct sigaction handlerW;
+    handlerW.sa_flags = (SA_SIGINFO | SA_RESTART);
+    sigemptyset(&handlerW.sa_mask);
+    handlerW.sa_sigaction = handler;
+    if (sigaction(SIGWINCH, &handlerW, nullptr) == -1)
+      perror("sigaction");
+  }
+  bool resizeIfNecessary(bool autodraw = false) {
+    if (shouldResize) {
+      getTerminalDimensions(width, height);
+      shouldResize = false;
+      if (autodraw) draw();
+      return true;
+    }
+    return false;
+  }
 };
 
 int main(int argc, char** argv) {
@@ -881,7 +926,7 @@ int main(int argc, char** argv) {
   int keycode = 0;
   buffer.draw();
   while (keycode != SpecialKeys::QUIT) {
-    keycode = getKey();
+    keycode = buffer.shouldResize ? SpecialKeys::UNKNOWN : getKey();
     //std::cout << keycode << "\r\n";
     buffer.react(keycode);
     buffer.draw();
