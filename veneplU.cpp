@@ -1,5 +1,6 @@
 #define _X_OPEN_SOURCE
 #include <locale.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,7 @@
 #include <iostream>
 #include <stack>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 const char* CLEAR_EVERYTHING = "\x1b[2J\x1b[3J\x1b[H\x1b[0m";
@@ -56,10 +58,38 @@ int mkdirRecursive(std::string dir) {
     int stat = mkdirRecursive(dir.substr(0, lastSlash));
     if (stat != 0) return stat;
   }
+  if (dir.empty()) return 0; // Surely you have a / dir?
   int stat = mkdir(dir.c_str(),
       S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
-  if (stat != 0) return errno;
+  if (stat != 0 && errno != EEXIST) return errno;
   return 0;
+}
+
+const char* WHITESPACE = " \t\n\r";
+std::string&& trimWhitespace(const std::string& s) {
+  size_t begin = s.find_first_not_of(WHITESPACE);
+  size_t end = s.find_last_not_of(WHITESPACE);
+  if (begin == std::string::npos || end == std::string::npos)
+    return std::move(std::string(""));
+  return std::move(s.substr(begin, end + 1));
+}
+
+std::string&& toLower(const std::string& s) {
+  std::string t = s;
+  for (char& c : t) c = tolower(c);
+  return std::move(t);
+}
+
+bool isTruthy(const std::string& s) {
+  std::string t = toLower(s);
+  return t == "1" || t == "true" ||
+    t == "yes" || t == "y" ||
+    t == "sel" || t == "one";
+}
+
+std::string getHome() {
+  struct passwd* pw = getpwuid(getuid());
+  return std::string(pw->pw_dir);
 }
 
 bool isASCII(unsigned char c) {
@@ -437,28 +467,19 @@ size_t unwcswidthp(const std::string& s, size_t vlen) {
 class Buffer;
 Buffer* globalBuffer = nullptr;
 
+// Options
+
+enum BoolOptions {
+  B_LINE_NUMBERS = 0,
+  // add new ones before this line
+  B_COUNT
+};
+const std::unordered_map<std::string, size_t> boolOptionsByName = {
+  {"vatarika", 0},
+};
+
 class Buffer {
 public:
-  Buffer() {
-    getTerminalDimensions(width, height);
-    registerHandler();
-    addLineAtBack("");
-  }
-  void read(const char* fname) {
-    lines.clear();
-    vlengths.clear();
-    filename = fname;
-    std::ifstream fh(fname, std::ios::binary);
-    std::string curLine;
-    while (!fh.eof()) {
-      char c = fh.get();
-      if (c == '\n') {
-        addLineAtBack(curLine);
-        curLine = "";
-      }
-      else curLine += c;
-    }
-  }
   std::vector<std::string> lines;
   std::vector<size_t> vlengths;
   // cursorCol can extend beyond the line length, but that
@@ -470,6 +491,7 @@ public:
   bool shouldResize = false;
   bool dirty = false;
   bool prompting = false;
+  bool first = true;
   std::string message;
   std::string promptInput;
   size_t promptVLength;
@@ -477,6 +499,78 @@ public:
   std::string filename;
   DHRBox box;
   bool isDHR;
+  class Options {
+  public:
+    Options() :
+      boolOptions(BoolOptions::B_COUNT) {}
+    bool lineno() { return boolOptions[BoolOptions::B_LINE_NUMBERS]; }
+    std::vector<bool> boolOptions;
+  };
+  Options options;
+  Buffer() {
+    getTerminalDimensions(width, height);
+    registerHandler();
+    addLineAtBack("");
+    readOptions();
+  }
+  void read(const char* fname) {
+    lines.clear();
+    vlengths.clear();
+    filename = fname;
+    std::ifstream fh(fname, std::ios::binary);
+    if (fh.fail()) {
+      dirty = true;
+      return;
+    }
+    std::string curLine;
+    while (!fh.eof()) {
+      char c = fh.get();
+      if (c == '\n') {
+        addLineAtBack(curLine);
+        curLine = "";
+      }
+      else curLine += c;
+    }
+  }
+  void readOptions() {
+    std::ifstream fh(getHome() + "/.veneplU_dat/options");
+    if (fh.fail()) return;
+    std::string s;
+    std::vector<std::string> invalidOptions;
+    while (getline(fh, s)) {
+      size_t firstNonspace = s.find_first_not_of(WHITESPACE);
+      if (firstNonspace == std::string::npos || s[firstNonspace] == '#')
+        continue;
+      // Get the parts
+      size_t split = s.find('=');
+      std::string key = trimWhitespace(s.substr(0, split));
+      std::string value = trimWhitespace(s.substr(split + 1));
+      auto it1 = boolOptionsByName.find(key);
+      if (it1 != boolOptionsByName.end()) {
+        size_t index = it1->second;
+        options.boolOptions[index] = isTruthy(value);
+      } else {
+        // invalid option
+        invalidOptions.push_back(key);
+        std::cout << key << '\n';
+        std::cin.get();
+      }
+    }
+    if (!invalidOptions.empty()) {
+      message = "";
+      for (const std::string opt : invalidOptions) {
+        message += '"';
+        message += opt;
+        message += "\" ";
+      }
+      message += "turotenus kêl ";
+      message +=
+        (invalidOptions.size() == 1) ? "ase" :
+        (invalidOptions.size() == 2) ? "ases" : "ese";
+      message += '!';
+      messageColour = 9;
+    }
+  }
   void draw() {
     resizeIfNecessary();
     // Clear entire screen and the scrollback buffer,
@@ -486,9 +580,9 @@ public:
     for (size_t i = 0; i < height - 1; ++i) {
       size_t lineno = i + scrollRow;
       if (lineno >= lines.size()) {
-        output += "\x1b[34m~\x1b[0m\r\n";
+        drawBlank(output, lineno);
       } else {
-        drawLine(lines[lineno], output);
+        drawLine(lines[lineno], output, lineno);
       }
     }
     if (message.empty()) {
@@ -529,7 +623,8 @@ public:
       output += "\x1b[";
       output += std::to_string(cursorRow - scrollRow + 1); // row
       output += ";";
-      output += std::to_string(std::min(cursorVCol, vlengths[cursorRow]) + 1); // column
+      size_t horizontalOffset = options.lineno() ? 6 : 0;
+      output += std::to_string(std::min(cursorVCol, vlengths[cursorRow]) + 1 + horizontalOffset); // column
       output += "H";
     } else {
       drawMessage(output);
@@ -539,7 +634,8 @@ public:
     write(0, output.c_str(), output.length());
   }
   void react(int keycode) {
-    message = "";
+    if (!first) message = "";
+    else first = false;
     if (isDHR && keycode >= 0) {
       keycode = box.feed(keycode);
       if (keycode <= 0) {
@@ -582,6 +678,7 @@ private:
     }
   }
   void right() {
+    if (cursorRow == lines.size()) return;
     auto& line = prompting ? promptInput : lines[cursorRow];
     auto& vlength = prompting ? promptVLength : vlengths[cursorRow];
     cursorCol = std::min(cursorCol, line.length());
@@ -720,10 +817,22 @@ private:
     lines.insert(lines.begin() + i, s);
     vlengths.insert(vlengths.begin() + i, wcswidthp(s));
   }
-  void drawLine(const std::string& s, std::string& output,
+  void drawLineNo(std::string& output, size_t lineno) {
+    if (options.lineno()) {
+      std::string lstr = toString(lineno + 1);
+      output += "\x1b[38;5;208m";
+      output += std::string(5 - lstr.length(), ' ');
+      output += lstr;
+      output += ' ';
+      output += "\x1b[0m";
+    }
+  }
+  void drawLine(const std::string& s, std::string& output, size_t lineno,
       size_t start = 0, bool newline = true) {
     // Draws the current line
     size_t taken = 0;
+    if (newline) drawLineNo(output, lineno);
+    if (options.lineno() && newline) taken += 5;
     UTF8Iterator<const std::string> it(s), end(s, true);
     bool broken = false;
     // - 1 to leave room for a $ in case we need more lines
@@ -772,6 +881,10 @@ private:
       if (newline) output += "\x1b[E";
     }
     else if (newline) output += "\r\n";
+  }
+  void drawBlank(std::string& output, size_t lineno) {
+    drawLineNo(output, lineno);
+    output += "\x1b[34m~\x1b[0m\r\n";
   }
   void drawMessage(std::string& output) {
     output += "\x1b[3";
@@ -881,7 +994,7 @@ private:
       output += std::to_string(offset + 3);
       output += 'H';
       // Print message
-      drawLine(promptInput, output, offset + 2, false);
+      drawLine(promptInput, output, 0, offset + 2, false);
       write(0, output.c_str(), output.length());
     }
     prompting = false;
