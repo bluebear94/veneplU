@@ -232,9 +232,11 @@ enum SpecialKeys {
   COPY,
   SAVE_AS,
   DHR_MODE,
+  RESET,
 };
 
 int get1c() {
+  errno = 0;
   unsigned char c;
   read(0, &c, 1);
   if (errno == EINTR) return -1;
@@ -243,8 +245,9 @@ int get1c() {
 
 int getKey() {
   using std::cin;
-  if (cin.eof()) return SpecialKeys::UNKNOWN;
-  unsigned char c1 = cin.get();
+  int c = get1c();
+  if (c == -1) return SpecialKeys::RESET;
+  unsigned char c1 = c;
   if (c1 == 127) return SpecialKeys::BACKSPACE;
   if (c1 >= 32) {
     if (isASCII(c1)) return c1;
@@ -533,7 +536,7 @@ public:
     }
 
     // Finally, actually render the damn thing.
-    std::cout << output;
+    write(0, output.c_str(), output.length());
   }
   void react(int keycode) {
     message = "";
@@ -555,6 +558,7 @@ public:
       case SpecialKeys::SAVE: saveIntractive(); break;
       case SpecialKeys::SAVE_AS: saveIntractive(true); break;
       case SpecialKeys::DHR_MODE: isDHR = !isDHR; box.reset(); break;
+      case SpecialKeys::RESET: std::cout << '\a'; break;
       case SpecialKeys::UNKNOWN: break;
       default: insert(keycode);
     }
@@ -780,11 +784,11 @@ private:
   void saveIntractive(bool forcePrompt = false) {
     std::string fname;
     if (filename == "" || forcePrompt) {
-      message = "Sydál kentos mej kemeṫa?";
+      message = "Sydál kentos mej kemeṫys?";
       messageColour = 14;
       bool stat1 = prompt();
       if (!stat1 || promptInput.empty()) {
-        message = "Syda kêl neltera.";
+        message = "Syda kêl nelterus.";
         messageColour = 1;
         return;
       }
@@ -792,11 +796,11 @@ private:
     } else fname = filename;
     std::error_code stat = save(fname);
     if (stat) {
-      message = "Syda kêl nelteġera: ";
+      message = "Syda kêl nelteġerus: ";
       message += stat.message();
       messageColour = 9;
     } else {
-      message = "Syda neltera.";
+      message = "Syda nelterus.";
       messageColour = 10;
     }
   }
@@ -829,8 +833,8 @@ private:
     output += std::to_string(height);
     output += ";1H";
     drawMessage(output);
-    output += "  ";
-    std::cout << output;
+    output += "  \x1b[0m";
+    write(0, output.c_str(), output.length());
   }
   bool prompt() {
     // Save cursor position
@@ -860,7 +864,7 @@ private:
           case SpecialKeys::BACKSPACE: backspace(); break;
           case SpecialKeys::DELETE: del(); break;
           case SpecialKeys::UNKNOWN: break;
-          default: insert(keycode);
+          default: if (keycode >= 0) insert(keycode);
         }
       }
       std::string output;
@@ -878,7 +882,7 @@ private:
       output += 'H';
       // Print message
       drawLine(promptInput, output, offset + 2, false);
-      std::cout << output;
+      write(0, output.c_str(), output.length());
     }
     prompting = false;
     // Restore cursor position
@@ -887,12 +891,13 @@ private:
     return done;
   }
   static void handler(int sig, siginfo_t* si, void* mydata) {
+    std::cout << '\a';
     globalBuffer->shouldResize = true;
   }
   void registerHandler() {
     globalBuffer = this;
     struct sigaction handlerW;
-    handlerW.sa_flags = (SA_SIGINFO | SA_RESTART);
+    handlerW.sa_flags = (SA_SIGINFO);
     sigemptyset(&handlerW.sa_mask);
     handlerW.sa_sigaction = handler;
     if (sigaction(SIGWINCH, &handlerW, nullptr) == -1)
