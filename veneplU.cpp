@@ -66,7 +66,7 @@ int mkdirRecursive(std::string dir) {
 }
 
 const char* WHITESPACE = " \t\n\r";
-std::string&& trimWhitespace(const std::string& s) {
+std::string trimWhitespace(const std::string& s) {
   size_t begin = s.find_first_not_of(WHITESPACE);
   size_t end = s.find_last_not_of(WHITESPACE);
   if (begin == std::string::npos || end == std::string::npos)
@@ -74,7 +74,7 @@ std::string&& trimWhitespace(const std::string& s) {
   return std::move(s.substr(begin, end + 1));
 }
 
-std::string&& toLower(const std::string& s) {
+std::string toLower(const std::string& s) {
   std::string t = s;
   for (char& c : t) c = tolower(c);
   return std::move(t);
@@ -228,9 +228,9 @@ private:
   size_t i;
 };
 
-std::string&& utf8CodepointToChar(int code) {
-  if (code < 0) return std::move(std::string(1, (char) -code));
-  if (code < 128) return std::move(std::string(1, (char) code));
+std::string utf8CodepointToChar(int code) {
+  if (code < 0) return std::string(1, (char) -code);
+  if (code < 128) return std::string(1, (char) code);
   std::string s;
   if (code < 0x800) { // 2 bytes
     s += (char) (0xC0 | (code >> 6));
@@ -245,7 +245,7 @@ std::string&& utf8CodepointToChar(int code) {
     s += (char) (0x80 | ((code >> 6) & 63));
     s += (char) (0x80 | (code & 63));
   }
-  return std::move(s);
+  return s;
 }
 
 enum SpecialKeys {
@@ -341,8 +341,8 @@ int getKey() {
   return SpecialKeys::UNKNOWN;
 }
 
-template<typename N> std::string&& toString(N n) {
-  if (n == 0) return std::move(std::string("0"));
+template<typename N> std::string toString(N n) {
+  if (n == 0) return std::string("0");
   std::string s;
   bool negative = false;
   if (n < 0) {
@@ -356,7 +356,7 @@ template<typename N> std::string&& toString(N n) {
   }
   if (negative) s += '-';
   std::reverse(s.begin(), s.end());
-  return std::move(s);
+  return s;
 }
 
 const char* VOWELS = "aeiouy";
@@ -676,6 +676,10 @@ private:
       cursorCol = lines[cursorRow].length();
       cursorVCol = vlengths[cursorRow];
     }
+    // Out of bounds?
+    if (cursorRow < scrollRow) {
+      --scrollRow;
+    }
   }
   void right() {
     if (cursorRow == lines.size()) return;
@@ -693,7 +697,10 @@ private:
       cursorCol = 0;
       cursorVCol = 0;
     }
-    // TODO advance one line if already at very right
+    // Out of bounds?
+    if (cursorRow >= scrollRow + height - 1) {
+      ++scrollRow;
+    }
   }
   // The following two methods are not used in prompts.
   void up() {
