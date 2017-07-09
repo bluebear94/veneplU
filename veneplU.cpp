@@ -619,17 +619,16 @@ public:
           box.forceUnstress ? "ūu" : "ûu";
         output += "]";
       }
-      // Move cursor to correct position.
-      output += "\x1b[";
-      output += std::to_string(cursorRow - scrollRow + 1); // row
-      output += ";";
-      size_t horizontalOffset = options.lineno() ? 6 : 0;
-      output += std::to_string(std::min(cursorVCol, vlengths[cursorRow]) + 1 + horizontalOffset); // column
-      output += "H";
     } else {
       drawMessage(output);
     }
-
+    // Move cursor to correct position.
+    output += "\x1b[";
+    output += std::to_string(cursorRow - scrollRow + 1); // row
+    output += ";";
+    size_t horizontalOffset = options.lineno() ? 6 : 0;
+    output += std::to_string(std::min(cursorVCol, vlengths[cursorRow]) + 1 + horizontalOffset); // column
+    output += "H";
     // Finally, actually render the damn thing.
     write(0, output.c_str(), output.length());
   }
