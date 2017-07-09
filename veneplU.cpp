@@ -847,7 +847,7 @@ private:
       int codepoint = it.getAndAdvance();
       size_t len = it.position() - oldPosition;
       size_t w = wcwidthp(codepoint);
-      if (taken + w >= width + 1 - start) {
+      if (taken + w >= width - 1 - start) {
         broken = true;
         break;
       }
