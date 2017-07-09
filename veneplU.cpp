@@ -487,6 +487,8 @@ public:
   size_t cursorRow = 0, cursorCol = 0;
   size_t cursorVCol = 0;
   size_t scrollRow = 0;
+  size_t scrollCol = 0;
+  size_t scrollVCol = 0;
   size_t width, height;
   bool shouldResize = false;
   bool dirty = false;
@@ -503,7 +505,7 @@ public:
   public:
     Options() :
       boolOptions(BoolOptions::B_COUNT) {}
-    bool lineno() { return boolOptions[BoolOptions::B_LINE_NUMBERS]; }
+    bool lineno() const { return boolOptions[BoolOptions::B_LINE_NUMBERS]; }
     std::vector<bool> boolOptions;
   };
   Options options;
@@ -576,14 +578,17 @@ public:
     // Clear entire screen and the scrollback buffer,
     // and move the cursor to the top-left corner.
     std::string output = CLEAR_EVERYTHING;
+    size_t rows = 0;
+    size_t lineno = scrollRow;
     // Draw each line.
-    for (size_t i = 0; i < height - 1; ++i) {
-      size_t lineno = i + scrollRow;
+    while (rows < height - 1) {
       if (lineno >= lines.size()) {
         drawBlank(output, lineno);
+        ++rows;
       } else {
-        drawLine(lines[lineno], output, lineno);
+        rows += drawLine(lines[lineno], output, lineno);
       }
+      ++lineno;
     }
     if (message.empty()) {
       // Info about the buffer.
@@ -659,6 +664,12 @@ public:
     }
   }
 private:
+  size_t actualWidth() const {
+    size_t xoff = 0;
+    if (prompting) xoff = message.length() + 2;
+    else if (options.lineno()) xoff = 6;
+    return width - xoff;
+  }
   void left() {
     auto& line = prompting ? promptInput : lines[cursorRow];
     auto& vlength = prompting ? promptVLength : vlengths[cursorRow];
@@ -670,10 +681,28 @@ private:
       int codepoint = it.get();
       cursorCol = it.position();
       cursorVCol -= wcwidthp(codepoint);
+      if (cursorCol < scrollCol) {
+        scrollCol = cursorCol;
+        scrollVCol = cursorVCol;
+      }
     } else if (cursorRow > 0 && !prompting) {
       --cursorRow;
       cursorCol = lines[cursorRow].length();
       cursorVCol = vlengths[cursorRow];
+      scrollCol = cursorCol;
+      scrollVCol = cursorVCol;
+      // Get the earliest character that we can anchor to
+      UTF8Iterator it(lines[cursorRow], cursorCol);
+      size_t nReceded = 0;
+      while (nReceded < actualWidth()) {
+        --it;
+        int codepoint = it.get();
+        size_t gw = wcwidthp(codepoint);
+        nReceded += gw;
+        if (it.position() == 0) break;
+      }
+      scrollCol = it.position();
+      scrollVCol -= nReceded;
     }
     // Out of bounds?
     if (cursorRow < scrollRow) {
@@ -687,18 +716,47 @@ private:
     cursorCol = std::min(cursorCol, line.length());
     cursorVCol = std::min(cursorVCol, vlength);
     if (cursorCol < line.length()) {
+      size_t old = cursorCol;
       UTF8Iterator it(line, cursorCol);
       int codepoint = it.getAndAdvance();
       cursorCol = it.position();
-      cursorVCol += wcwidthp(codepoint);
+      size_t gw = wcwidthp(codepoint);
+      cursorVCol += gw;
+      if (cursorVCol >= scrollVCol + actualWidth()) {
+        scrollVCol += gw;
+        scrollCol += cursorCol - old;
+      }
     } else if (cursorRow < lines.size() && !prompting) {
       ++cursorRow;
       cursorCol = 0;
       cursorVCol = 0;
+      // no possibility of horizontal OOB here
+      scrollCol = 0;
+      scrollVCol = 0;
     }
     // Out of bounds?
     if (cursorRow >= scrollRow + height - 1) {
       ++scrollRow;
+    }
+  }
+  void horizontalScrollAdjust() {
+    if (cursorCol < scrollCol) {
+      scrollCol = cursorCol;
+      scrollVCol = cursorVCol;
+    }
+    if (cursorVCol >= scrollVCol + actualWidth()) {
+      // Get the earliest character that we can anchor to
+      UTF8Iterator it(lines[cursorRow], cursorCol);
+      size_t nReceded = 0;
+      while (nReceded < actualWidth()) {
+        --it;
+        int codepoint = it.get();
+        size_t gw = wcwidthp(codepoint);
+        nReceded += gw;
+        if (it.position() == 0) break;
+      }
+      scrollCol = it.position();
+      scrollVCol -= nReceded;
     }
   }
   // The following two methods are not used in prompts.
@@ -712,6 +770,7 @@ private:
     if (cursorRow < scrollRow) {
       --scrollRow;
     }
+    horizontalScrollAdjust();
   }
   void down() {
     if (cursorRow < lines.size()) {
@@ -728,6 +787,7 @@ private:
     if (cursorRow >= scrollRow + height - 1) {
       ++scrollRow;
     }
+    horizontalScrollAdjust();
   }
   void del() {
     auto& line = prompting ? promptInput : lines[cursorRow];
@@ -833,7 +893,7 @@ private:
       output += "\x1b[0m";
     }
   }
-  void drawLine(const std::string& s, std::string& output, size_t lineno,
+  size_t drawLine(const std::string& s, std::string& output, size_t lineno,
       size_t start = 0, bool newline = true) {
     // Draws the current line
     size_t taken = 0;
@@ -887,6 +947,7 @@ private:
       if (newline) output += "\x1b[E";
     }
     else if (newline) output += "\r\n";
+    return 1;
   }
   void drawBlank(std::string& output, size_t lineno) {
     drawLineNo(output, lineno);
